@@ -1,0 +1,10 @@
+
+{
+  "name": "ai-firewall-lab-hackathon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A demonstrable AI input security gateway",
+  "engines": {
+    "node": ">=20"
+  }
+}
