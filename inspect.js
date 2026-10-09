@@ -1,5 +1,6 @@
 
 const logSecurityEvent = require("./log-event");
+const sendRiskAlert = require("./email-alert");
 
 const MAX_CHARS = 12000;
 
@@ -61,7 +62,9 @@ function inspectPrompt(text) {
     score = Math.max(score, 40);
   }
 
-  const configuredThreshold = Number(process.env.RISK_THRESHOLD || 50);
+  const configuredThreshold = Number(
+    process.env.RISK_THRESHOLD || 50
+  );
 
   const threshold = Number.isFinite(configuredThreshold)
     ? Math.min(90, Math.max(10, configuredThreshold))
@@ -161,15 +164,32 @@ module.exports = async function (req, res) {
   try {
     const result = inspectPrompt(text);
 
-    // Logging failure must not turn an unsafe request into an allow.
-    await logSecurityEvent({
-      decision: result.decision,
-      risk_score: result.score,
-      categories: result.reasons,
-      endpoint: "/api/inspect",
-      duration_ms: Date.now() - startedAt,
-      error_category: null
-    });
+    // Email alerts are best-effort. A delivery failure must not
+    // change the inspection verdict or turn a block into an allow.
+    try {
+      await sendRiskAlert({
+        score: result.score,
+        decision: result.decision,
+        reasons: result.reasons,
+        prompt: text
+      });
+    } catch {
+      console.error("Risk alert could not be processed.");
+    }
+
+    // Preserve the existing metadata-only security event logging.
+    try {
+      await logSecurityEvent({
+        decision: result.decision,
+        risk_score: result.score,
+        categories: result.reasons,
+        endpoint: "/api/inspect",
+        duration_ms: Date.now() - startedAt,
+        error_category: null
+      });
+    } catch {
+      console.error("Security event logging unavailable.");
+    }
 
     return res.status(200).json({
       ...result,
