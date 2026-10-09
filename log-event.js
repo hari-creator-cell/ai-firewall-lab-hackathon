@@ -1,58 +1,124 @@
 module.exports = async function logSecurityEvent(event) {
-const url = process.env.SUPABASE_URL;
-const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  try {
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!url || !key) {
-console.error("Security event logging is not configured.");
-return;
-}
+    // Fail safely when server configuration is missing.
+    if (!url || !key) {
+      console.error("Security event logging is not configured.");
+      return false;
+    }
 
-const decisions = ["ALLOW", "REVIEW", "BLOCK"];
-const endpoints = ["/api/inspect", "/api/chat", "system"];
+    // Validate the Supabase URL before making a request.
+    let baseUrl;
 
-if (!decisions.includes(event.decision) ||
-!endpoints.includes(event.endpoint)) return;
+    try {
+      baseUrl = new URL(url);
 
-const payload = {
-decision: event.decision,
-risk_score: Math.max(0, Math.min(100,
-Math.round(Number(event.risk_score) || 0))),
-categories: Array.isArray(event.categories)
-? event.categories
-.filter(x => typeof x === "string")
-.slice(0, 20)
-: [],
-endpoint: event.endpoint,
-duration_ms: Number.isFinite(event.duration_ms)
-? Math.max(0, Math.round(event.duration_ms))
-: null,
-error_category: typeof event.error_category === "string"
-? event.error_category.slice(0, 80)
-: null,
-request_fingerprint: null
-};
+      if (
+        baseUrl.protocol !== "https:" ||
+        baseUrl.username ||
+        baseUrl.password ||
+        baseUrl.search ||
+        baseUrl.hash
+      ) {
+        console.error("Security event logging configuration is invalid.");
+        return false;
+      }
+    } catch {
+      console.error("Security event logging configuration is invalid.");
+      return false;
+    }
 
-try {
-const response = await fetch(
-"${url.replace(/\/+$/, "")}/rest/v1/ai_firewall_security_events",
-{
-method: "POST",
-headers: {
-apikey: key,
-Authorization: "Bearer ${key}",
-"Content-Type": "application/json",
-Prefer: "return=minimal"
-},
-body: JSON.stringify(payload),
-signal: AbortSignal.timeout(2000)
-}
-);
+    // Accept only known event decisions and endpoints.
+    const allowedDecisions = ["ALLOW", "REVIEW", "BLOCK"];
 
-if (!response.ok) {
-  console.error("Security event logging failed:", response.status);
-}
+    const allowedEndpoints = [
+      "/api/inspect",
+      "/api/chat",
+      "system"
+    ];
 
-} catch {
-console.error("Security event logging unavailable.");
-}
+    if (
+      !event ||
+      !allowedDecisions.includes(event.decision) ||
+      !allowedEndpoints.includes(event.endpoint)
+    ) {
+      return false;
+    }
+
+    // Keep categories short and bounded.
+    const categories = Array.isArray(event.categories)
+      ? event.categories
+          .filter(
+            item =>
+              typeof item === "string" &&
+              item.length > 0 &&
+              item.length <= 100
+          )
+          .slice(0, 20)
+      : [];
+
+    const numericScore = Number(event.risk_score);
+
+    const riskScore = Number.isFinite(numericScore)
+      ? Math.max(0, Math.min(100, Math.round(numericScore)))
+      : 0;
+
+    const numericDuration = Number(event.duration_ms);
+
+    const durationMs =
+      event.duration_ms !== null &&
+      event.duration_ms !== undefined &&
+      Number.isFinite(numericDuration)
+        ? Math.max(0, Math.min(2147483647, Math.round(numericDuration)))
+        : null;
+
+    const errorCategory =
+      typeof event.error_category === "string"
+        ? event.error_category.slice(0, 80)
+        : null;
+
+    // Store metadata only. Never store prompts, responses, or credentials.
+    const payload = {
+      decision: event.decision,
+      risk_score: riskScore,
+      categories,
+      endpoint: event.endpoint,
+      duration_ms: durationMs,
+      error_category: errorCategory,
+      request_fingerprint: null
+    };
+
+    const endpoint =
+      `${baseUrl.origin}${baseUrl.pathname.replace(/\/+$/, "")}` +
+      "/rest/v1/ai_firewall_security_events";
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal"
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(2000)
+    });
+
+    if (!response.ok) {
+      // Do not log the request body, key, or database response body.
+      console.error(
+        "Security event logging failed with HTTP status:",
+        response.status
+      );
+      return false;
+    }
+
+    return true;
+  } catch {
+    // Logging failures must not expose secrets or crash the application.
+    console.error("Security event logging unavailable.");
+    return false;
+  }
 };
