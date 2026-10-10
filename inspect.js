@@ -1,45 +1,39 @@
 
-const logSecurityEvent = require("./log-event");
+const crypto = require("crypto");
 
 const MAX_CHARS = 12000;
 
 function inspectPrompt(text) {
   const rules = [
     {
-      name: "Sensitive file access or data disclosure",
+      name: "Sensitive data disclosure",
       score: 90,
-      pattern:
-        /\b(?:inspect|scan|search|read|access|open|extract|collect|reveal|disclose|expose|dump|export|retrieve)\b.{0,100}\b(?:user|users|customer|customers|private|personal|confidential|hidden|internal)\b.{0,100}\b(?:files?|documents?|data|details|records?|contents?|information|secrets?)\b|\b(?:reveal|disclose|expose|dump|export|exfiltrate)\b.{0,100}\b(?:hidden|private|personal|confidential|sensitive)\b.{0,60}\b(?:data|details|files?|records?|contents?|information)\b/i
+      pattern: /\b(reveal|disclose|dump|export|expose)\b.{0,80}\b(private|personal|confidential|sensitive)\b/i
     },
     {
       name: "Instruction override / prompt injection",
       score: 85,
-      pattern:
-        /ignore\s+(all\s+)?(previous|prior|above|system|developer)\s+instructions|disregard\s+(all\s+)?(previous|prior|above)\s+instructions|reveal\s+(your\s+)?(hidden\s+)?(system prompt|developer message)|override\s+(the\s+)?(system|safety|security)\s+(prompt|rules|instructions)/i
+      pattern: /ignore\s+(all\s+)?(previous|prior|above|system|developer)\s+instructions|reveal\s+(your\s+)?hidden\s+system prompt|override\s+(the\s+)?(system|safety|security)\s+(prompt|rules|instructions)/i
     },
     {
       name: "Jailbreak or safety bypass",
       score: 80,
-      pattern:
-        /act as (an? )?(unrestricted|uncensored|jailbroken)|ignore (your )?(safety|content) policies|bypass (all )?(safety|security|approval) (rules|checks|filters)/i
+      pattern: /act as (an? )?(unrestricted|uncensored|jailbroken)|bypass (all )?(safety|security|approval) (rules|checks|filters)/i
     },
     {
-      name: "Credential or secret exfiltration",
+      name: "Credential or secret request",
       score: 90,
-      pattern:
-        /(reveal|show|print|exfiltrate|dump|send|export).{0,50}(api[_ -]?keys?|passwords?|credentials?|tokens?|secrets?)|(api[_ -]?keys?|passwords?|credentials?|access tokens?).{0,50}(reveal|show|print|dump|send|exfiltrate)/i
+      pattern: /(reveal|show|print|dump|send|export).{0,50}(api[_ -]?keys?|passwords?|credentials?|tokens?|secrets?)/i
     },
     {
-      name: "Unauthorized tool or action request",
+      name: "Unauthorized action request",
       score: 75,
-      pattern:
-        /execute (an? )?unauthorized action|bypass.{0,30}(approval|permission|authorization)|run (shell|terminal) commands? without approval|disable (the )?(security|audit) logs/i
+      pattern: /execute (an? )?unauthorized action|bypass.{0,30}(approval|permission|authorization)|disable (the )?(security|audit) logs/i
     },
     {
-      name: "Potential secret in submitted text",
+      name: "Possible secret pattern",
       score: 75,
-      pattern:
-        /(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/
+      pattern: /(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/
     }
   ];
 
@@ -53,147 +47,133 @@ function inspectPrompt(text) {
     }
   }
 
-  if (
-    /internal configuration|confidential data|private records/i.test(text) &&
-    !reasons.length
-  ) {
-    reasons.push("Potentially sensitive internal information request");
-    score = Math.max(score, 40);
-  }
-
-  const configuredThreshold = Number(process.env.RISK_THRESHOLD || 50);
-
-  const threshold = Number.isFinite(configuredThreshold)
-    ? Math.min(90, Math.max(10, configuredThreshold))
+  const configured = Number(process.env.RISK_THRESHOLD || 50);
+  const threshold = Number.isFinite(configured)
+    ? Math.min(90, Math.max(10, configured))
     : 50;
 
-  const decision =
-    score >= threshold
-      ? "BLOCK"
-      : reasons.length
-        ? "REVIEW"
-        : "ALLOW";
+  const decision = score >= threshold
+    ? "BLOCK"
+    : reasons.length
+      ? "REVIEW"
+      : "ALLOW";
 
-  return {
-    score,
-    decision,
-    reasons,
-    blocked: decision === "BLOCK"
-  };
+  if (!reasons.length) {
+    reasons.push(
+      "No configured threat pattern matched. This is not a guarantee of safety."
+    );
+  }
+
+  return { score, decision, reasons, blocked: decision === "BLOCK" };
 }
 
 function bodyOf(req) {
-  if (req.body && typeof req.body === "object") {
-    return req.body;
-  }
-
+  if (req.body && typeof req.body === "object") return req.body;
   if (typeof req.body === "string") {
-    try {
-      return JSON.parse(req.body);
-    } catch {
-      return null;
-    }
+    try { return JSON.parse(req.body); } catch {}
   }
-
   return null;
 }
 
-function valid(req, res) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
-    res.status(405).json({
-      error: "Method not allowed. Use POST."
-    });
-    return false;
-  }
-
-  const origin = req.headers.origin;
-  const host = req.headers.host;
-
-  if (origin && host) {
-    try {
-      if (new URL(origin).host !== host) {
-        res.status(403).json({
-          error: "Cross-origin requests are not allowed."
-        });
-        return false;
-      }
-    } catch {
-      res.status(403).json({
-        error: "Invalid request origin."
-      });
-      return false;
-    }
-  }
-
-  return true;
+function send(res, status, body) {
+  return res.status(status).json(body);
 }
 
-module.exports = async function (req, res) {
-  const startedAt = Date.now();
+async function saveTransfer(record) {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  if (!valid(req, res)) {
-    return;
+  if (!url || !key) throw new Error("Storage is not configured");
+
+  const base = new URL(url);
+  if (base.protocol !== "https:" || !base.hostname.endsWith(".supabase.co")) {
+    throw new Error("Invalid storage URL");
+  }
+
+  const response = await fetch(
+    `${base.origin}/rest/v1/ai_firewall_transfers`,
+    {
+      method: "POST",
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal"
+      },
+      body: JSON.stringify(record),
+      signal: AbortSignal.timeout(5000)
+    }
+  );
+
+  if (!response.ok) {
+    // Do not print prompt contents or secrets to deployment logs.
+    throw new Error("Database insert failed with HTTP " + response.status);
+  }
+}
+
+module.exports = async function inspectHandler(req, res) {
+  res.setHeader("Cache-Control", "no-store");
+
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return send(res, 405, { error: "Use POST." });
   }
 
   const body = bodyOf(req);
-
   if (!body || typeof body.text !== "string") {
-    return res.status(400).json({
-      error: "Provide a JSON body with a text string."
-    });
+    return send(res, 400, { error: "Provide a text string." });
   }
 
   const text = body.text.trim();
-
-  if (!text) {
-    return res.status(400).json({
-      error: "Text must not be empty."
-    });
-  }
-
+  if (!text) return send(res, 400, { error: "Text is empty." });
   if (text.length > MAX_CHARS) {
-    return res.status(413).json({
-      error: "Text exceeds the 12,000 character limit."
-    });
+    return send(res, 413, { error: "Maximum prompt length is 12,000 characters." });
   }
+
+  const suppliedId = body.requestId;
+  const requestId = typeof suppliedId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(suppliedId)
+      ? suppliedId
+      : crypto.randomUUID();
+
+  const startedAt = Date.now();
+  const result = inspectPrompt(text);
 
   try {
-    const result = inspectPrompt(text);
-
-    // Logging failure must not turn an unsafe request into an allow.
-    await logSecurityEvent({
+    await saveTransfer({
+      request_id: requestId,
+      source_app: body.sourceApp === "Nova AI" ? "Nova AI" : "Lab Dashboard",
+      prompt_text: text,
       decision: result.decision,
       risk_score: result.score,
-      categories: result.reasons,
-      endpoint: "/api/inspect",
-      duration_ms: Date.now() - startedAt,
-      error_category: null
-    });
-
-    return res.status(200).json({
-      ...result,
-      modelCalled: false,
-      source: "Server-side rules",
-      reasons: result.reasons.length
-        ? result.reasons
-        : [
-            "No configured threat pattern matched. This is not a guarantee of safety."
-          ]
+      reasons: result.reasons,
+      transfer_status: "INSPECTED",
+      model_called: false,
+      action_executed: false
     });
   } catch {
-    console.error("Prompt inspection failed.");
-
-    return res.status(500).json({
-      error: "Inspection unavailable.",
-      decision: "BLOCK",
-      score: 100,
-      reasons: ["Inspection error; request failed closed."],
-      blocked: true,
+    // Do not claim persistent recording if storage failed.
+    return send(res, 503, {
+      error: "Inspection completed, but the result could not be saved to the audit database. No successful transfer record was created.",
+      decision: result.decision,
+      score: result.score,
+      reasons: result.reasons,
+      requestId,
+      storageSaved: false,
       modelCalled: false,
-      source: "Server error"
+      actionExecuted: false
     });
   }
+
+  return send(res, 200, {
+    ...result,
+    requestId,
+    source: "Server-side rules",
+    modelCalled: false,
+    actionExecuted: false,
+    storageSaved: true,
+    durationMs: Date.now() - startedAt
+  });
 };
 
 module.exports.inspectPrompt = inspectPrompt;
